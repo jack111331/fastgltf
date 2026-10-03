@@ -887,3 +887,244 @@ TEST_CASE("Extension KHR_node_hoverability", "[gltf-loader]") {
 	REQUIRE(asset->nodes[1].hoverable);
 	REQUIRE(!asset->nodes[2].hoverable);
 }
+
+TEST_CASE("Extension MYLAB_generative", "[gltf-loader]") {
+	fastgltf::Parser parser(fastgltf::Extensions::MYLAB_generative);
+	auto mylabGenerativeValid = path / "mylab_generative_valid.gltf";
+	fastgltf::GltfFileStream jsonData(mylabGenerativeValid);
+	REQUIRE(jsonData.isOpen());
+	auto asset = parser.loadGltfJson(jsonData, mylabGenerativeValid);
+	REQUIRE(asset.error() == fastgltf::Error::None);
+	REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+
+	SECTION("Generator registry") {
+		REQUIRE(asset->generators.size() == 1);
+
+		const auto& generator = asset->generators.front();
+		REQUIRE(generator.name == "cam_gen");
+		REQUIRE(generator.task == fastgltf::GenerativeTask::TextToCameraTrajectory);
+		REQUIRE(generator.model.uri == "models/camtraj.onnx");
+		REQUIRE(generator.model.sha256 == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+		REQUIRE(generator.model.skeleton.empty());
+
+		// fps is spelled as a JSON integer in the fixture, which simdjson still reads as a double.
+		REQUIRE(generator.output.fps == Catch::Approx(30.0));
+		REQUIRE(generator.output.cameraConvention == fastgltf::CameraConvention::OpenCV);
+		// Conventions absent from the file fall back to the glTF-native defaults.
+		REQUIRE(generator.output.poseType == fastgltf::PoseType::CamToWorld);
+		REQUIRE(generator.output.rotation == fastgltf::RotationEncoding::Quaternion);
+		REQUIRE(generator.output.upAxis == fastgltf::UpAxis::Y);
+		REQUIRE(generator.output.units == fastgltf::LengthUnit::Meters);
+
+		REQUIRE(asset->generativeTimeline.has_value());
+		REQUIRE(asset->generativeTimeline->duration == Catch::Approx(8.0));
+	}
+
+	SECTION("Node reference") {
+		REQUIRE(asset->nodes.size() == 2);
+		REQUIRE(!asset->nodes[0].generative); // A node without the extension carries no payload.
+
+		REQUIRE(asset->nodes[1].generative);
+		const auto& generative = *asset->nodes[1].generative;
+		REQUIRE(generative.generator == 0);
+		REQUIRE(generative.prompt == "slow orbit around the actor, ending on a close-up");
+		REQUIRE(generative.seed.has_value());
+		REQUIRE(generative.seed.value() == 7);
+		REQUIRE(generative.start == Catch::Approx(0.5));
+		REQUIRE(generative.duration.has_value());
+		REQUIRE(generative.duration.value() == Catch::Approx(6.0));
+		REQUIRE(generative.conditionOn.lookAtNode.has_value());
+		REQUIRE(generative.conditionOn.lookAtNode.value() == 0);
+		REQUIRE(!generative.conditionOn.useGeneratedMotionOf.has_value());
+		REQUIRE(!generative.fallbackAnimation.has_value());
+		REQUIRE(generative.initialPose == fastgltf::InitialPose::Unconstrained);
+		REQUIRE(generative.jointMap.empty());
+	}
+
+	SECTION("Moving the asset preserves the extension data") {
+		// Asset is handed back through Expected<Asset>, so a member missing from either move
+		// operator would drop the registry silently rather than failing to compile.
+		fastgltf::Asset moved = std::move(asset.get());
+		REQUIRE(moved.generators.size() == 1);
+		REQUIRE(moved.generators.front().name == "cam_gen");
+		REQUIRE(moved.generativeTimeline.has_value());
+		REQUIRE(moved.generativeTimeline->duration == Catch::Approx(8.0));
+		REQUIRE(moved.nodes[1].generative);
+		REQUIRE(moved.nodes[1].generative->prompt == "slow orbit around the actor, ending on a close-up");
+
+		fastgltf::Asset assigned;
+		assigned = std::move(moved);
+		REQUIRE(assigned.generators.size() == 1);
+		REQUIRE(assigned.generativeTimeline.has_value());
+		REQUIRE(assigned.nodes[1].generative);
+	}
+
+	SECTION("Invalid - generator index out of range") {
+		asset->nodes[1].generative->generator = 1;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->nodes[1].generative->generator = 0;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - fallbackAnimation index out of range") {
+		// The asset declares no animations at all, so any index is out of range.
+		asset->nodes[1].generative->fallbackAnimation = 0;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->nodes[1].generative->fallbackAnimation.reset();
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - conditionOn node index out of range") {
+		asset->nodes[1].generative->conditionOn.lookAtNode = asset->nodes.size();
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->nodes[1].generative->conditionOn.lookAtNode = 0;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - extension data present but not marked as used") {
+		asset->extensionsUsed.clear();
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+
+		// Still caught once the registry is empty too, which is the cheapest thing for the
+		// check to accidentally skip over.
+		asset->generators.clear();
+		asset->generativeTimeline.reset();
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+	}
+
+	SECTION("Invalid - non-positive fps") {
+		asset->generators.front().output.fps = 0;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->generators.front().output.fps = 30;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - non-positive timeline duration") {
+		asset->generativeTimeline->duration = 0;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->generativeTimeline->duration = 8;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - convention that is meaningless for the declared task") {
+		// A camera trajectory generator has no rotation encoding and no skeleton to declare.
+		asset->generators.front().output.rotation = fastgltf::RotationEncoding::AxisAngle;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->generators.front().output.rotation = fastgltf::RotationEncoding::Quaternion;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+
+		// Conversely, a motion generator has no camera convention to declare. The fixture's
+		// generator sets cameraConvention, so merely flipping the task makes it incoherent.
+		asset->generators.front().task = fastgltf::GenerativeTask::TextToMotion;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+		asset->generators.front().output.cameraConvention = fastgltf::CameraConvention::Gltf;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - a conditionOn cycle") {
+		// Make node 0 generative too, then point the two nodes at each other.
+		asset->nodes[0].generative = std::make_unique<fastgltf::GenerativeNode>();
+		asset->nodes[0].generative->generator = 0;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+
+		asset->nodes[0].generative->conditionOn.useGeneratedMotionOf = 1;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+
+		// Breaking either direction makes it a DAG again.
+		asset->nodes[1].generative->conditionOn.lookAtNode.reset();
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+
+	SECTION("Invalid - a node conditioned on itself") {
+		asset->nodes[1].generative->conditionOn.useGeneratedMotionOf = 1;
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::InvalidGltf);
+	}
+
+	SECTION("Valid - conditioning on a node that is not itself generated") {
+		// Node 0 has no generative payload, so lookAtNode is not a scheduling dependency and
+		// cannot take part in a cycle.
+		REQUIRE(asset->nodes[1].generative->conditionOn.lookAtNode.value() == 0);
+		REQUIRE(!asset->nodes[0].generative);
+		REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+	}
+}
+
+TEST_CASE("Extension MYLAB_generative joint maps", "[gltf-loader]") {
+	// A skinned node needs a mesh with JOINTS_0/WEIGHTS_0 to pass validate(), so this asset is
+	// built in C++ rather than hand-written as a fixture with a base64 buffer.
+	fastgltf::Asset asset;
+	asset.extensionsUsed.emplace_back("MYLAB_generative");
+
+	fastgltf::Generator generator = {};
+	generator.task = fastgltf::GenerativeTask::TextToMotion;
+	generator.model.uri = "models/t2m_v2.onnx";
+	generator.model.skeleton = "smpl_22";
+	generator.output.fps = 20;
+	generator.output.rotation = fastgltf::RotationEncoding::AxisAngle;
+	generator.output.upAxis = fastgltf::UpAxis::Z;
+	asset.generators.emplace_back(std::move(generator));
+
+	// Accessors only have to satisfy validate()'s type rules; they reference no buffer data.
+	fastgltf::Accessor position = {};
+	position.type = fastgltf::AccessorType::Vec3;
+	position.componentType = fastgltf::ComponentType::Float;
+	position.count = 1;
+	position.min = fastgltf::AccessorBoundsArray::ForType<double>(3);
+	position.max = fastgltf::AccessorBoundsArray::ForType<double>(3);
+	asset.accessors.emplace_back(std::move(position));
+
+	fastgltf::Accessor joints = {};
+	joints.type = fastgltf::AccessorType::Vec4;
+	joints.componentType = fastgltf::ComponentType::UnsignedShort;
+	joints.count = 1;
+	asset.accessors.emplace_back(std::move(joints));
+
+	fastgltf::Accessor weights = {};
+	weights.type = fastgltf::AccessorType::Vec4;
+	weights.componentType = fastgltf::ComponentType::Float;
+	weights.count = 1;
+	asset.accessors.emplace_back(std::move(weights));
+
+	fastgltf::Primitive primitive = {};
+	primitive.attributes.emplace_back(fastgltf::Attribute { "POSITION", 0 });
+	primitive.attributes.emplace_back(fastgltf::Attribute { "JOINTS_0", 1 });
+	primitive.attributes.emplace_back(fastgltf::Attribute { "WEIGHTS_0", 2 });
+	asset.meshes.emplace_back();
+	asset.meshes.front().primitives.emplace_back(std::move(primitive));
+
+	// Nodes 1 and 2 are the joints; node 0 carries the mesh, the skin and the generator reference.
+	asset.nodes.emplace_back();
+	asset.nodes.emplace_back();
+	asset.nodes.emplace_back();
+	asset.nodes[0].meshIndex = 0;
+	asset.nodes[0].skinIndex = 0;
+
+	asset.skins.emplace_back();
+	asset.skins.front().joints.emplace_back(1);
+	asset.skins.front().joints.emplace_back(2);
+
+	asset.nodes[0].generative = std::make_unique<fastgltf::GenerativeNode>();
+	auto& generative = *asset.nodes[0].generative;
+	generative.generator = 0;
+	generative.prompt = "a person walks forward, then waves with the right hand";
+	generative.jointMap.emplace_back(fastgltf::JointMapping { "left_hip", 1 });
+	generative.jointMap.emplace_back(fastgltf::JointMapping { "right_hip", 2 });
+
+	REQUIRE(fastgltf::validate(asset) == fastgltf::Error::None);
+
+	SECTION("Invalid - a joint that is not one of the skin's joints") {
+		generative.jointMap[1].nodeIndex = 0;
+		REQUIRE(fastgltf::validate(asset) == fastgltf::Error::InvalidGltf);
+	}
+
+	SECTION("Invalid - the same model joint named twice") {
+		generative.jointMap[1].name = generative.jointMap[0].name;
+		REQUIRE(fastgltf::validate(asset) == fastgltf::Error::InvalidGltf);
+	}
+
+	SECTION("Invalid - a joint map on a node without a skin") {
+		asset.nodes[0].skinIndex.reset();
+		asset.nodes[0].meshIndex.reset();
+		REQUIRE(fastgltf::validate(asset) == fastgltf::Error::InvalidGltf);
+	}
+}

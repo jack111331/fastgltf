@@ -92,6 +92,41 @@ LightType
 
 .. doxygenenum:: fastgltf::LightType
 
+GenerativeTask
+--------------
+
+.. doxygenenum:: fastgltf::GenerativeTask
+
+RotationEncoding
+----------------
+
+.. doxygenenum:: fastgltf::RotationEncoding
+
+UpAxis
+------
+
+.. doxygenenum:: fastgltf::UpAxis
+
+LengthUnit
+----------
+
+.. doxygenenum:: fastgltf::LengthUnit
+
+CameraConvention
+----------------
+
+.. doxygenenum:: fastgltf::CameraConvention
+
+PoseType
+--------
+
+.. doxygenenum:: fastgltf::PoseType
+
+InitialPose
+-----------
+
+.. doxygenenum:: fastgltf::InitialPose
+
 
 glTF structs
 ============
@@ -163,6 +198,62 @@ Light
 -----
 
 .. doxygenstruct:: fastgltf::Light
+   :members:
+   :undoc-members:
+
+
+GeneratorModel
+--------------
+
+.. doxygenstruct:: fastgltf::GeneratorModel
+   :members:
+   :undoc-members:
+
+
+GeneratorOutput
+---------------
+
+.. doxygenstruct:: fastgltf::GeneratorOutput
+   :members:
+   :undoc-members:
+
+
+Generator
+---------
+
+.. doxygenstruct:: fastgltf::Generator
+   :members:
+   :undoc-members:
+
+
+JointMapping
+------------
+
+.. doxygenstruct:: fastgltf::JointMapping
+   :members:
+   :undoc-members:
+
+
+GenerativeConditioning
+----------------------
+
+.. doxygenstruct:: fastgltf::GenerativeConditioning
+   :members:
+   :undoc-members:
+
+
+GenerativeNode
+--------------
+
+.. doxygenstruct:: fastgltf::GenerativeNode
+   :members:
+   :undoc-members:
+
+
+GenerativeTimeline
+------------------
+
+.. doxygenstruct:: fastgltf::GenerativeTimeline
    :members:
    :undoc-members:
 

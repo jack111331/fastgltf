@@ -10,11 +10,13 @@ To view the full changelogs for each release please see the `GitHub releases <ht
 =====
 
 - An incredible amount of validation fixes, internal parsing/exporting fixes, and general code improvements
+- Fix: ``escapeString`` now escapes control characters, which JSON forbids unescaped inside strings
 - Add support for more extensions
     - KHR_draco_mesh_compression (`#66 <https://github.com/spnda/fastgltf/issues/66>`_)
     - KHR_physics_rigid_bodies (`#95 <https://github.com/spnda/fastgltf/pull/95>`_)
     - GODOT_single_root (`#100 <https://github.com/spnda/fastgltf/pull/100>`_)
     - KHR_materials_diffuse_transmission
+    - MYLAB_generative
 - Add: More support for DXMath vectors/matrices
 - Add: C++23 monadic operators on custom OptionalWithFlagValue
 - Add: ``IterableAccessor`` satisfies ``ranges::input_range``

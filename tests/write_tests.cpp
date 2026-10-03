@@ -479,3 +479,137 @@ TEST_CASE("Test empty scene omits nodes array", "[write-tests]") {
 	REQUIRE(json.find(R"("nodes":[])") == std::string::npos);
 	REQUIRE(json.find(R"({"name":"Empty"})") != std::string::npos);
 }
+
+TEST_CASE("Round-trip a glTF with MYLAB_generative", "[write-tests]") {
+	auto mylabGenerativeValid = path / "mylab_generative_valid.gltf";
+	fastgltf::GltfFileStream jsonData(mylabGenerativeValid);
+	REQUIRE(jsonData.isOpen());
+
+	fastgltf::Parser parser(fastgltf::Extensions::MYLAB_generative);
+	auto asset = parser.loadGltfJson(jsonData, mylabGenerativeValid);
+	REQUIRE(asset.error() == fastgltf::Error::None);
+	REQUIRE(fastgltf::validate(asset.get()) == fastgltf::Error::None);
+
+	fastgltf::Exporter exporter;
+	auto expected = exporter.writeGltfJson(asset.get());
+	REQUIRE(expected.error() == fastgltf::Error::None);
+
+	auto exportedJsonData = fastgltf::GltfDataBuffer::FromBytes(
+			reinterpret_cast<const std::byte*>(expected.get().output.data()), expected.get().output.size());
+	REQUIRE(exportedJsonData.error() == fastgltf::Error::None);
+	auto exported = parser.loadGltfJson(exportedJsonData.get(), mylabGenerativeValid);
+	REQUIRE(exported.error() == fastgltf::Error::None);
+	REQUIRE(fastgltf::validate(exported.get()) == fastgltf::Error::None);
+
+	// The whole point of writing the extension out is that a re-read recovers the same data.
+	REQUIRE(exported->generators.size() == 1);
+	const auto& generator = exported->generators.front();
+	REQUIRE(generator.name == "cam_gen");
+	REQUIRE(generator.task == fastgltf::GenerativeTask::TextToCameraTrajectory);
+	REQUIRE(generator.model.uri == "models/camtraj.onnx");
+	REQUIRE(generator.model.sha256 == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+	REQUIRE(generator.output.fps == 30);
+	REQUIRE(generator.output.cameraConvention == fastgltf::CameraConvention::OpenCV);
+
+	REQUIRE(exported->generativeTimeline.has_value());
+	REQUIRE(exported->generativeTimeline->duration == 8);
+
+	REQUIRE(exported->nodes.size() == 2);
+	REQUIRE(!exported->nodes[0].generative);
+	REQUIRE(exported->nodes[1].generative);
+	const auto& generative = *exported->nodes[1].generative;
+	REQUIRE(generative.generator == 0);
+	REQUIRE(generative.prompt == "slow orbit around the actor, ending on a close-up");
+	REQUIRE(generative.seed.has_value());
+	REQUIRE(generative.seed.value() == 7);
+	REQUIRE(generative.start == 0.5);
+	REQUIRE(generative.duration.has_value());
+	REQUIRE(generative.duration.value() == 6);
+	REQUIRE(generative.conditionOn.lookAtNode.has_value());
+	REQUIRE(generative.conditionOn.lookAtNode.value() == 0);
+}
+
+TEST_CASE("Test MYLAB_generative output shape and string escaping", "[write-tests]") {
+	fastgltf::Asset asset;
+	// The exporter passes extensionsUsed through verbatim rather than deriving it from the data,
+	// so a hand-built asset has to declare the extension itself.
+	asset.extensionsUsed.emplace_back("MYLAB_generative");
+
+	fastgltf::Generator generator = {};
+	generator.task = fastgltf::GenerativeTask::TextToMotion;
+	generator.model.uri = "models/t2m_v2.onnx";
+	generator.model.skeleton = "smpl_22";
+	generator.output.fps = 20;
+	generator.output.rotation = fastgltf::RotationEncoding::AxisAngle;
+	generator.output.upAxis = fastgltf::UpAxis::Z;
+	generator.name = "motion_gen";
+	asset.generators.emplace_back(std::move(generator));
+	asset.generativeTimeline = fastgltf::GenerativeTimeline { 8 };
+
+	asset.nodes.emplace_back();
+	asset.nodes.front().generative = std::make_unique<fastgltf::GenerativeNode>();
+	asset.nodes.front().generative->generator = 0;
+	// Prompts are arbitrary user text, so they have to survive JSON escaping.
+	asset.nodes.front().generative->prompt = "she said \"hello\"\nthen \\ waved";
+	asset.nodes.front().generative->seed = 42;
+
+	fastgltf::Exporter exporter;
+	auto result = exporter.writeGltfJson(asset);
+	REQUIRE(result.error() == fastgltf::Error::None);
+	const auto& json = result.get().output;
+
+	REQUIRE(json.find(R"("MYLAB_generative":{"generators":[)") != std::string::npos);
+	REQUIRE(json.find(R"("task":"text_to_motion")") != std::string::npos);
+	// Floats go through to_string_fp (grisu2), which always spells out a decimal point.
+	REQUIRE(json.find(R"("output":{"fps":20.0)") != std::string::npos);
+	REQUIRE(json.find(R"("skeleton":"smpl_22")") != std::string::npos);
+	REQUIRE(json.find(R"("rotation":"axis_angle")") != std::string::npos);
+	REQUIRE(json.find(R"("upAxis":"Z")") != std::string::npos);
+	REQUIRE(json.find(R"("name":"motion_gen")") != std::string::npos);
+	REQUIRE(json.find(R"("timeline":{"duration":8.0})") != std::string::npos);
+	REQUIRE(json.find(R"("MYLAB_generative":{"generator":0)") != std::string::npos);
+	REQUIRE(json.find(R"("seed":42)") != std::string::npos);
+	// Hoisted out of REQUIRE: MSVC's legacy preprocessor mangles raw string literals that are
+	// passed as macro arguments.
+	const std::string escapedPrompt = "\"prompt\":\"she said \\\"hello\\\"\\nthen \\\\ waved\"";
+	REQUIRE(json.find(escapedPrompt) != std::string::npos);
+
+	// Defaults are omitted rather than written out.
+	REQUIRE(json.find(R"("units")") == std::string::npos);
+	REQUIRE(json.find(R"("cameraConvention")") == std::string::npos);
+	REQUIRE(json.find(R"("poseType")") == std::string::npos);
+	REQUIRE(json.find(R"("start")") == std::string::npos);
+
+	// And the escaped prompt survives a re-read intact.
+	auto exportedJsonData = fastgltf::GltfDataBuffer::FromBytes(
+			reinterpret_cast<const std::byte*>(json.data()), json.size());
+	REQUIRE(exportedJsonData.error() == fastgltf::Error::None);
+	fastgltf::Parser parser(fastgltf::Extensions::MYLAB_generative);
+	auto exported = parser.loadGltfJson(exportedJsonData.get(), path);
+	REQUIRE(exported.error() == fastgltf::Error::None);
+	REQUIRE(exported->nodes.front().generative);
+	REQUIRE(exported->nodes.front().generative->prompt == "she said \"hello\"\nthen \\ waved");
+}
+
+TEST_CASE("Test JSON string escaping", "[write-tests]") {
+	REQUIRE(fastgltf::escapeString("").empty());
+	REQUIRE(fastgltf::escapeString("plain text") == "plain text");
+	REQUIRE(fastgltf::escapeString("a\"b") == "a\\\"b");
+	REQUIRE(fastgltf::escapeString("a\\b") == "a\\\\b");
+
+	// JSON forbids raw control characters inside strings, so these have to come back escaped.
+	// Prompts and names are arbitrary user text and do contain newlines.
+	REQUIRE(fastgltf::escapeString("a\bb") == "a\\bb");
+	REQUIRE(fastgltf::escapeString("a\fb") == "a\\fb");
+	REQUIRE(fastgltf::escapeString("a\nb") == "a\\nb");
+	REQUIRE(fastgltf::escapeString("a\rb") == "a\\rb");
+	REQUIRE(fastgltf::escapeString("a\tb") == "a\\tb");
+
+	// Control characters without a short escape fall back to \u00XX.
+	REQUIRE(fastgltf::escapeString(std::string_view("a\x01" "b", 3)) == "a\\u0001b");
+	REQUIRE(fastgltf::escapeString(std::string_view("a\x1f" "b", 3)) == "a\\u001fb");
+
+	// Anything from U+0020 up is passed through untouched, including UTF-8 continuation bytes.
+	REQUIRE(fastgltf::escapeString(" ") == " ");
+	REQUIRE(fastgltf::escapeString("\xc3\xa9") == "\xc3\xa9");
+}

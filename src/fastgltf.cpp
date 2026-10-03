@@ -1459,6 +1459,138 @@ fg::Error fg::validate(const Asset& asset) {
 		}
 	}
 
+	// MYLAB_generative. This runs after every per-object loop because the root generator registry
+	// and the nodes referencing it are parsed in JSON key order, so neither can be assumed to have
+	// been seen first.
+	{
+		for (const auto& generator : asset.generators) {
+			if (!(generator.output.fps > 0))
+				return Error::InvalidGltf;
+
+			// A generator declares the conventions of its own output, so a field that carries no
+			// meaning for the declared task must be left at its default rather than guessed at.
+			switch (generator.task) {
+				case GenerativeTask::TextToMotion: {
+					if (generator.output.cameraConvention != CameraConvention::Gltf)
+						return Error::InvalidGltf;
+					if (generator.output.poseType != PoseType::CamToWorld)
+						return Error::InvalidGltf;
+					break;
+				}
+				case GenerativeTask::TextToCameraTrajectory: {
+					if (generator.output.rotation != RotationEncoding::Quaternion)
+						return Error::InvalidGltf;
+					if (!generator.model.skeleton.empty())
+						return Error::InvalidGltf;
+					break;
+				}
+			}
+		}
+
+		if (asset.generativeTimeline.has_value() && !(asset.generativeTimeline->duration > 0))
+			return Error::InvalidGltf;
+
+		bool anyGenerative = false;
+		for (const auto& node : asset.nodes) {
+			if (!node.generative)
+				continue;
+			anyGenerative = true;
+
+			if (!isExtensionUsed(extensions::MYLAB_generative))
+				return Error::InvalidGltf;
+
+			const auto& generative = *node.generative;
+			if (generative.generator >= asset.generators.size())
+				return Error::InvalidGltf;
+			if (generative.fallbackAnimation.has_value() && generative.fallbackAnimation.value() >= asset.animations.size())
+				return Error::InvalidGltf;
+			if (generative.conditionOn.lookAtNode.has_value() && generative.conditionOn.lookAtNode.value() >= asset.nodes.size())
+				return Error::InvalidGltf;
+			if (generative.conditionOn.useGeneratedMotionOf.has_value() && generative.conditionOn.useGeneratedMotionOf.value() >= asset.nodes.size())
+				return Error::InvalidGltf;
+
+			if (!(generative.start >= 0))
+				return Error::InvalidGltf;
+			if (generative.duration.has_value() && !(generative.duration.value() > 0))
+				return Error::InvalidGltf;
+
+			if (!generative.jointMap.empty()) {
+				// A joint map only means anything relative to a skin, and every joint it names has
+				// to be one of that skin's joints.
+				if (!node.skinIndex.has_value())
+					return Error::InvalidGltf;
+
+				const auto& joints = asset.skins[node.skinIndex.value()].joints;
+				for (std::size_t i = 0; i < generative.jointMap.size(); ++i) {
+					bool isSkinJoint = false;
+					for (const auto joint : joints) {
+						if (joint == generative.jointMap[i].nodeIndex) {
+							isSkinJoint = true;
+							break;
+						}
+					}
+					if (!isSkinJoint)
+						return Error::InvalidGltf;
+
+					for (std::size_t j = i + 1; j < generative.jointMap.size(); ++j) {
+						if (generative.jointMap[j].name == generative.jointMap[i].name)
+							return Error::InvalidGltf;
+					}
+				}
+			}
+		}
+
+		// Nothing references a generator, so there is no dependency graph to check.
+		if (anyGenerative) {
+			// The conditionOn references between generative nodes form a DAG, which has to be acyclic
+			// for a consumer to be able to evaluate the generators in topological order. Iterative
+			// three-colour DFS; recursion here would be driven by untrusted input.
+			enum class Mark : std::uint8_t { White, Grey, Black };
+			std::vector<Mark> marks(asset.nodes.size(), Mark::White);
+			std::vector<std::pair<std::size_t, std::uint8_t>> stack;
+
+			// Only an edge to another *generated* node is a scheduling dependency; conditioning on a
+			// statically posed node resolves without running anything upstream.
+			const auto edge = [&asset](std::size_t node, std::uint8_t which) {
+				const auto& conditionOn = asset.nodes[node].generative->conditionOn;
+				Optional<std::size_t> target = which == 0 ? conditionOn.useGeneratedMotionOf : conditionOn.lookAtNode;
+				if (target.has_value() && !asset.nodes[target.value()].generative)
+					target.reset();
+				return target;
+			};
+
+			for (std::size_t root = 0; root < asset.nodes.size(); ++root) {
+				if (!asset.nodes[root].generative || marks[root] != Mark::White)
+					continue;
+
+				marks[root] = Mark::Grey;
+				stack.emplace_back(root, 0);
+				while (!stack.empty()) {
+					// Copied out, because the emplace_back below can reallocate the stack.
+					const auto node = stack.back().first;
+					const auto which = stack.back().second;
+					if (which >= 2) {
+						marks[node] = Mark::Black;
+						stack.pop_back();
+						continue;
+					}
+					++stack.back().second;
+
+					const auto target = edge(node, which);
+					if (!target.has_value())
+						continue;
+
+					if (marks[target.value()] == Mark::Grey)
+						return Error::InvalidGltf; // Back edge, so the graph is cyclic.
+					if (marks[target.value()] == Mark::White) {
+						marks[target.value()] = Mark::Grey;
+						stack.emplace_back(target.value(), 0);
+					}
+				}
+			}
+		}
+	}
+
 	return Error::None;
 }
 
@@ -2464,6 +2596,32 @@ fg::Error fg::Parser::parseExtensions(const simdjson::dom::object& extensionsObj
 				break;
 			}
 #endif
+			case force_consteval<crc32c(extensions::MYLAB_generative)>: {
+				if (!hasBit(config.extensions, Extensions::MYLAB_generative))
+					break;
+
+				dom::array generatorsArray;
+				if (auto arrayError = extensionObject["generators"].get_array().get(generatorsArray); arrayError == SUCCESS) FASTGLTF_LIKELY {
+					if (auto generatorsError = parseGenerators(generatorsArray, asset); generatorsError != Error::None) FASTGLTF_UNLIKELY {
+						return generatorsError;
+					}
+				} else if (arrayError != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+					return Error::InvalidGltf;
+				}
+
+				dom::object timelineObject;
+				if (auto objectError = extensionObject["timeline"].get_object().get(timelineObject); objectError == SUCCESS) FASTGLTF_LIKELY {
+					double duration;
+					if (timelineObject["duration"].get_double().get(duration) != SUCCESS) FASTGLTF_UNLIKELY {
+						return Error::InvalidGltf;
+					}
+					asset.generativeTimeline = GenerativeTimeline { static_cast<num>(duration) };
+				} else if (objectError != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+					return Error::InvalidGltf;
+				}
+
+				break;
+			}
 			default:
 				continue;
 		}
@@ -2664,6 +2822,294 @@ fg::Error fg::Parser::parseLights(const simdjson::dom::array& lights, Asset& ass
 		}
 
 		asset.lights.emplace_back(std::move(light));
+	}
+
+	return Error::None;
+}
+
+fg::Error fg::Parser::parseGenerators(const simdjson::dom::array& generators, Asset& asset) {
+	using namespace simdjson;
+
+	asset.generators.reserve(generators.size());
+	for (auto generatorValue : generators) {
+		dom::object generatorObject;
+		if (generatorValue.get_object().get(generatorObject) != SUCCESS) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+		Generator generator = {};
+
+		std::string_view task;
+		if (generatorObject["task"].get_string().get(task) != SUCCESS) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+		switch (crcStringFunction(task)) {
+			case force_consteval<crc32c("text_to_motion")>: {
+				generator.task = GenerativeTask::TextToMotion;
+				break;
+			}
+			case force_consteval<crc32c("text_to_camera_trajectory")>: {
+				generator.task = GenerativeTask::TextToCameraTrajectory;
+				break;
+			}
+			default: {
+				return Error::InvalidGltf;
+			}
+		}
+
+		dom::object modelObject;
+		if (generatorObject["model"].get_object().get(modelObject) != SUCCESS) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view uri;
+		if (modelObject["uri"].get_string().get(uri) != SUCCESS) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+		generator.model.uri = FASTGLTF_CONSTRUCT_PMR_RESOURCE(decltype(generator.model.uri), resourceAllocator.get(), uri);
+
+		std::string_view sha256;
+		if (auto error = modelObject["sha256"].get_string().get(sha256); error == SUCCESS) FASTGLTF_LIKELY {
+			generator.model.sha256 = FASTGLTF_CONSTRUCT_PMR_RESOURCE(decltype(generator.model.sha256), resourceAllocator.get(), sha256);
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view skeleton;
+		if (auto error = modelObject["skeleton"].get_string().get(skeleton); error == SUCCESS) FASTGLTF_LIKELY {
+			generator.model.skeleton = FASTGLTF_CONSTRUCT_PMR_RESOURCE(decltype(generator.model.skeleton), resourceAllocator.get(), skeleton);
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		dom::object outputObject;
+		if (generatorObject["output"].get_object().get(outputObject) != SUCCESS) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		double fps;
+		if (outputObject["fps"].get_double().get(fps) != SUCCESS) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+		generator.output.fps = static_cast<num>(fps);
+
+		std::string_view rotation;
+		if (auto error = outputObject["rotation"].get_string().get(rotation); error == SUCCESS) FASTGLTF_LIKELY {
+			switch (crcStringFunction(rotation)) {
+				case force_consteval<crc32c("quaternion")>: {
+					generator.output.rotation = RotationEncoding::Quaternion;
+					break;
+				}
+				case force_consteval<crc32c("axis_angle")>: {
+					generator.output.rotation = RotationEncoding::AxisAngle;
+					break;
+				}
+				case force_consteval<crc32c("rotation_6d")>: {
+					generator.output.rotation = RotationEncoding::Rotation6D;
+					break;
+				}
+				default: {
+					return Error::InvalidGltf;
+				}
+			}
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view upAxis;
+		if (auto error = outputObject["upAxis"].get_string().get(upAxis); error == SUCCESS) FASTGLTF_LIKELY {
+			switch (crcStringFunction(upAxis)) {
+				case force_consteval<crc32c("Y")>: {
+					generator.output.upAxis = UpAxis::Y;
+					break;
+				}
+				case force_consteval<crc32c("Z")>: {
+					generator.output.upAxis = UpAxis::Z;
+					break;
+				}
+				default: {
+					return Error::InvalidGltf;
+				}
+			}
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view units;
+		if (auto error = outputObject["units"].get_string().get(units); error == SUCCESS) FASTGLTF_LIKELY {
+			switch (crcStringFunction(units)) {
+				case force_consteval<crc32c("meters")>: {
+					generator.output.units = LengthUnit::Meters;
+					break;
+				}
+				case force_consteval<crc32c("centimeters")>: {
+					generator.output.units = LengthUnit::Centimeters;
+					break;
+				}
+				default: {
+					return Error::InvalidGltf;
+				}
+			}
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view cameraConvention;
+		if (auto error = outputObject["cameraConvention"].get_string().get(cameraConvention); error == SUCCESS) FASTGLTF_LIKELY {
+			switch (crcStringFunction(cameraConvention)) {
+				case force_consteval<crc32c("gltf")>: {
+					generator.output.cameraConvention = CameraConvention::Gltf;
+					break;
+				}
+				case force_consteval<crc32c("opencv")>: {
+					generator.output.cameraConvention = CameraConvention::OpenCV;
+					break;
+				}
+				default: {
+					return Error::InvalidGltf;
+				}
+			}
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view poseType;
+		if (auto error = outputObject["poseType"].get_string().get(poseType); error == SUCCESS) FASTGLTF_LIKELY {
+			switch (crcStringFunction(poseType)) {
+				case force_consteval<crc32c("cam_to_world")>: {
+					generator.output.poseType = PoseType::CamToWorld;
+					break;
+				}
+				case force_consteval<crc32c("world_to_cam")>: {
+					generator.output.poseType = PoseType::WorldToCam;
+					break;
+				}
+				default: {
+					return Error::InvalidGltf;
+				}
+			}
+		} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::string_view name;
+		if (generatorObject["name"].get_string().get(name) == SUCCESS) {
+			generator.name = FASTGLTF_CONSTRUCT_PMR_RESOURCE(decltype(generator.name), resourceAllocator.get(), name);
+		}
+
+		asset.generators.emplace_back(std::move(generator));
+	}
+
+	return Error::None;
+}
+
+fg::Error fg::Parser::parseGenerativeNode(simdjson::dom::object& mylab_generative, Node& node) {
+	using namespace simdjson;
+
+	node.generative = std::make_unique<GenerativeNode>();
+	auto& generative = *node.generative;
+
+	std::uint64_t generator;
+	if (mylab_generative["generator"].get_uint64().get(generator) != SUCCESS) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+	generative.generator = static_cast<std::size_t>(generator);
+
+	std::string_view prompt;
+	if (auto error = mylab_generative["prompt"].get_string().get(prompt); error == SUCCESS) FASTGLTF_LIKELY {
+		generative.prompt = FASTGLTF_CONSTRUCT_PMR_RESOURCE(decltype(generative.prompt), resourceAllocator.get(), prompt);
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	std::uint64_t seed;
+	if (auto error = mylab_generative["seed"].get_uint64().get(seed); error == SUCCESS) FASTGLTF_LIKELY {
+		generative.seed = seed;
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	double start;
+	if (auto error = mylab_generative["start"].get_double().get(start); error == SUCCESS) FASTGLTF_LIKELY {
+		generative.start = static_cast<num>(start);
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	double duration;
+	if (auto error = mylab_generative["duration"].get_double().get(duration); error == SUCCESS) FASTGLTF_LIKELY {
+		generative.duration = static_cast<num>(duration);
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	dom::object jointMapObject;
+	if (auto error = mylab_generative["jointMap"].get_object().get(jointMapObject); error == SUCCESS) FASTGLTF_LIKELY {
+		// The joint node indices are only checked against the skin in validate(), which is the
+		// first point at which the skins are known to have been parsed.
+		generative.jointMap = FASTGLTF_CONSTRUCT_PMR_RESOURCE(decltype(generative.jointMap), resourceAllocator.get(), 0);
+		generative.jointMap.reserve(jointMapObject.size());
+		for (const auto jointField : jointMapObject) {
+			std::uint64_t jointNode;
+			if (jointField.value.get_uint64().get(jointNode) != SUCCESS) FASTGLTF_UNLIKELY {
+				return Error::InvalidGltf;
+			}
+			generative.jointMap.emplace_back(JointMapping {
+				FASTGLTF_CONSTRUCT_PMR_RESOURCE(FASTGLTF_STD_PMR_NS::string, resourceAllocator.get(), jointField.key),
+				static_cast<std::size_t>(jointNode),
+			});
+		}
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	dom::object constraintsObject;
+	if (auto error = mylab_generative["constraints"].get_object().get(constraintsObject); error == SUCCESS) FASTGLTF_LIKELY {
+		std::string_view initialPose;
+		if (auto poseError = constraintsObject["initialPose"].get_string().get(initialPose); poseError == SUCCESS) FASTGLTF_LIKELY {
+			switch (crcStringFunction(initialPose)) {
+				case force_consteval<crc32c("unconstrained")>: {
+					generative.initialPose = InitialPose::Unconstrained;
+					break;
+				}
+				case force_consteval<crc32c("bindPose")>: {
+					generative.initialPose = InitialPose::BindPose;
+					break;
+				}
+				default: {
+					return Error::InvalidGltf;
+				}
+			}
+		} else if (poseError != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	dom::object conditionOnObject;
+	if (auto error = mylab_generative["conditionOn"].get_object().get(conditionOnObject); error == SUCCESS) FASTGLTF_LIKELY {
+		std::uint64_t lookAtNode;
+		if (auto lookAtError = conditionOnObject["lookAtNode"].get_uint64().get(lookAtNode); lookAtError == SUCCESS) FASTGLTF_LIKELY {
+			generative.conditionOn.lookAtNode = static_cast<std::size_t>(lookAtNode);
+		} else if (lookAtError != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+
+		std::uint64_t useGeneratedMotionOf;
+		if (auto motionError = conditionOnObject["useGeneratedMotionOf"].get_uint64().get(useGeneratedMotionOf); motionError == SUCCESS) FASTGLTF_LIKELY {
+			generative.conditionOn.useGeneratedMotionOf = static_cast<std::size_t>(useGeneratedMotionOf);
+		} else if (motionError != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+			return Error::InvalidGltf;
+		}
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
+	}
+
+	std::uint64_t fallbackAnimation;
+	if (auto error = mylab_generative["fallbackAnimation"].get_uint64().get(fallbackAnimation); error == SUCCESS) FASTGLTF_LIKELY {
+		generative.fallbackAnimation = static_cast<std::size_t>(fallbackAnimation);
+	} else if (error != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
+		return Error::InvalidGltf;
 	}
 
 	return Error::None;
@@ -3851,6 +4297,17 @@ fg::Error fg::Parser::parseNodes(simdjson::dom::array& nodes, Asset& asset) {
 						return Error::InvalidGltf;
 					}
 				} else if (nodeHoverabilityError != NO_SUCH_FIELD) {
+					return Error::InvalidGltf;
+				}
+			}
+
+			if (hasBit(config.extensions, Extensions::MYLAB_generative)) {
+				dom::object generativeObject;
+				if (auto generativeError = extensionsObject[extensions::MYLAB_generative].get_object().get(generativeObject); generativeError == SUCCESS) FASTGLTF_LIKELY {
+					if (auto nodeError = parseGenerativeNode(generativeObject, node); nodeError != Error::None) FASTGLTF_UNLIKELY {
+						return nodeError;
+					}
+				} else if (generativeError != NO_SUCH_FIELD) FASTGLTF_UNLIKELY {
 					return Error::InvalidGltf;
 				}
 			}
@@ -5112,26 +5569,48 @@ void fg::prettyPrintJson(std::string& json) {
 
 namespace fastgltf {
 	static void escapeString(std::string& string) {
-		std::size_t i = 0;
-		do {
-			switch (string[i]) {
-				case '\"': {
-					constexpr std::string_view s = "\\\"";
-					string.replace(i, 1, s);
-					i += s.size();
+		std::string escaped;
+		escaped.reserve(string.size());
+		for (const auto c : string) {
+			switch (c) {
+				case '\"':
+					escaped += "\\\"";
+					break;
+				case '\\':
+					escaped += "\\\\";
+					break;
+				case '\b':
+					escaped += "\\b";
+					break;
+				case '\f':
+					escaped += "\\f";
+					break;
+				case '\n':
+					escaped += "\\n";
+					break;
+				case '\r':
+					escaped += "\\r";
+					break;
+				case '\t':
+					escaped += "\\t";
+					break;
+				default: {
+					// JSON forbids unescaped control characters inside strings, so anything below
+					// U+0020 without a short escape has to go out as a \uXXXX sequence. Without
+					// this a single newline in a name or a prompt produces unparseable output.
+					if (static_cast<unsigned char>(c) < 0x20) {
+						constexpr char hexDigits[] = "0123456789abcdef";
+						escaped += "\\u00";
+						escaped += hexDigits[(static_cast<unsigned char>(c) >> 4) & 0xF];
+						escaped += hexDigits[static_cast<unsigned char>(c) & 0xF];
+					} else {
+						escaped += c;
+					}
 					break;
 				}
-				case '\\': {
-					constexpr std::string_view s = "\\\\";
-					string.replace(i, 1, s);
-					i += s.size();
-					break;
-				}
-				default:
-					break;
 			}
-			++i;
-		} while (i < string.size());
+		}
+		string = std::move(escaped);
 	}
 
 	/**
@@ -5724,6 +6203,76 @@ void fg::Exporter::writeLights(const Asset& asset, std::string& json) {
 			json += ',';
 	}
 	json += "]}";
+}
+
+void fg::Exporter::writeGenerative(const Asset& asset, std::string& json) {
+	if (asset.generators.empty() && !asset.generativeTimeline.has_value())
+		return;
+	if (json.back() != '{')
+		json += ',';
+
+	json += R"("MYLAB_generative":{)";
+
+	if (!asset.generators.empty()) {
+		json += R"("generators":[)";
+		for (auto it = asset.generators.begin(); it != asset.generators.end(); ++it) {
+			json += '{';
+
+			json += R"("task":")";
+			switch (it->task) {
+				case GenerativeTask::TextToMotion: {
+					json += "text_to_motion";
+					break;
+				}
+				case GenerativeTask::TextToCameraTrajectory: {
+					json += "text_to_camera_trajectory";
+					break;
+				}
+			}
+			json += '"';
+
+			json += R"(,"model":{"uri":")" + fg::escapeString(it->model.uri) + '"';
+			if (!it->model.sha256.empty())
+				json += R"(,"sha256":")" + fg::escapeString(it->model.sha256) + '"';
+			if (!it->model.skeleton.empty())
+				json += R"(,"skeleton":")" + fg::escapeString(it->model.skeleton) + '"';
+			json += '}';
+
+			json += R"(,"output":{"fps":)" + to_string_fp(it->output.fps);
+			// Every convention other than fps is only emitted when it differs from the glTF-native
+			// default, so a generator that already works in glTF space stays terse.
+			if (it->output.rotation != RotationEncoding::Quaternion) {
+				json += R"(,"rotation":")";
+				json += it->output.rotation == RotationEncoding::AxisAngle ? "axis_angle" : "rotation_6d";
+				json += '"';
+			}
+			if (it->output.upAxis != UpAxis::Y)
+				json += R"(,"upAxis":"Z")";
+			if (it->output.units != LengthUnit::Meters)
+				json += R"(,"units":"centimeters")";
+			if (it->output.cameraConvention != CameraConvention::Gltf)
+				json += R"(,"cameraConvention":"opencv")";
+			if (it->output.poseType != PoseType::CamToWorld)
+				json += R"(,"poseType":"world_to_cam")";
+			json += '}';
+
+			if (!it->name.empty())
+				json += R"(,"name":")" + fg::escapeString(it->name) + '"';
+
+			json += '}';
+			if (uabs(std::distance(asset.generators.begin(), it)) + 1 < asset.generators.size())
+				json += ',';
+		}
+		json += ']';
+	}
+
+	if (asset.generativeTimeline.has_value()) {
+		if (json.back() != '{')
+			json += ',';
+		json += R"("timeline":{"duration":)" + to_string_fp(asset.generativeTimeline->duration) + '}';
+	}
+
+	json += '}';
 }
 
 void fg::Exporter::writeMaterials(const Asset& asset, std::string& json) {
@@ -6340,6 +6889,7 @@ void fg::Exporter::writeNodes(const Asset& asset, std::string& json) {
 #if FASTGLTF_ENABLE_KHR_PHYSICS_RIGID_BODIES
 			|| it->physicsRigidBody
 #endif
+			|| it->generative
 			|| !it->visible || !it->selectable || !it->hoverable
 			) {
 			if (json.back() != '{') json += ',';
@@ -6477,6 +7027,44 @@ void fg::Exporter::writeNodes(const Asset& asset, std::string& json) {
 			if (!it->hoverable) {
 				if (json.back() != '{') json += ',';
 				json += R"("KHR_node_hoverability":{"hoverable":false})";
+			}
+
+			if (it->generative) {
+				if (json.back() != '{') json += ',';
+				const auto& generative = *it->generative;
+				json += R"("MYLAB_generative":{"generator":)" + std::to_string(generative.generator);
+				if (!generative.prompt.empty())
+					json += R"(,"prompt":")" + fg::escapeString(generative.prompt) + '"';
+				if (generative.seed.has_value())
+					json += R"(,"seed":)" + std::to_string(generative.seed.value());
+				if (generative.start != num(0))
+					json += R"(,"start":)" + to_string_fp(generative.start);
+				if (generative.duration.has_value())
+					json += R"(,"duration":)" + to_string_fp(generative.duration.value());
+				if (!generative.jointMap.empty()) {
+					json += R"(,"jointMap":{)";
+					for (auto jit = generative.jointMap.begin(); jit != generative.jointMap.end(); ++jit) {
+						json += '"' + fg::escapeString(jit->name) + "\":" + std::to_string(jit->nodeIndex);
+						if (uabs(std::distance(generative.jointMap.begin(), jit)) + 1 < generative.jointMap.size())
+							json += ',';
+					}
+					json += '}';
+				}
+				if (generative.initialPose != InitialPose::Unconstrained)
+					json += R"(,"constraints":{"initialPose":"bindPose"})";
+				if (generative.conditionOn.lookAtNode.has_value() || generative.conditionOn.useGeneratedMotionOf.has_value()) {
+					json += R"(,"conditionOn":{)";
+					if (generative.conditionOn.lookAtNode.has_value())
+						json += R"("lookAtNode":)" + std::to_string(generative.conditionOn.lookAtNode.value());
+					if (generative.conditionOn.useGeneratedMotionOf.has_value()) {
+						if (json.back() != '{') json += ',';
+						json += R"("useGeneratedMotionOf":)" + std::to_string(generative.conditionOn.useGeneratedMotionOf.value());
+					}
+					json += '}';
+				}
+				if (generative.fallbackAnimation.has_value())
+					json += R"(,"fallbackAnimation":)" + std::to_string(generative.fallbackAnimation.value());
+				json += '}';
 			}
 
 			json += "}";
@@ -7044,6 +7632,7 @@ void fg::Exporter::writeExtensions(const fastgltf::Asset& asset, std::string& js
 	json += "\"extensions\":{";
 
 	writeLights(asset, json);
+	writeGenerative(asset, json);
 
 #if FASTGLTF_ENABLE_KHR_IMPLICIT_SHAPES
 	writeShapes(asset, json);

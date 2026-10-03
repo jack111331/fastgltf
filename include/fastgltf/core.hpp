@@ -242,6 +242,10 @@ namespace fastgltf {
 
 		// See https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_meshopt_compression/README.md
 		KHR_meshopt_compression = 1ULL << 34,
+
+		// Vendor extension describing scene components that are synthesised by neural networks.
+		// Holds a root-level registry of generators, and per node the conditioning used to drive one.
+		MYLAB_generative = 1ULL << 35,
 	};
 	// clang-format on
 
@@ -372,6 +376,7 @@ namespace fastgltf {
 		constexpr std::string_view MSFT_packing_normalRoughnessMetallic = "MSFT_packing_normalRoughnessMetallic";
 		constexpr std::string_view MSFT_packing_occlusionRoughnessMetallic = "MSFT_packing_occlusionRoughnessMetallic";
 		constexpr std::string_view MSFT_texture_dds = "MSFT_texture_dds";
+		constexpr std::string_view MYLAB_generative = "MYLAB_generative";
 
 #if FASTGLTF_ENABLE_KHR_IMPLICIT_SHAPES
 		constexpr std::string_view KHR_implicit_shapes = "KHR_implicit_shapes";
@@ -418,6 +423,7 @@ namespace fastgltf {
 		{ extensions::MSFT_packing_normalRoughnessMetallic,     Extensions::MSFT_packing_normalRoughnessMetallic },
 		{ extensions::MSFT_packing_occlusionRoughnessMetallic,  Extensions::MSFT_packing_occlusionRoughnessMetallic },
 		{ extensions::MSFT_texture_dds,                         Extensions::MSFT_texture_dds },
+		{ extensions::MYLAB_generative,                         Extensions::MYLAB_generative },
 
 #if FASTGLTF_ENABLE_KHR_IMPLICIT_SHAPES
 		{extensions::KHR_implicit_shapes,						Extensions::KHR_implicit_shapes},
@@ -862,6 +868,8 @@ namespace fastgltf {
 		Error parseBufferViews(const simdjson::dom::array& array, Asset& asset);
 		Error parseCameras(simdjson::dom::array& array, Asset& asset);
 		Error parseExtensions(const simdjson::dom::object& extensionsObject, Asset& asset);
+		Error parseGenerators(const simdjson::dom::array& array, Asset& asset);
+		Error parseGenerativeNode(simdjson::dom::object& mylab_generative, Node& node);
 		Error parseImages(simdjson::dom::array& array, Asset& asset);
 		Error parseLights(const simdjson::dom::array& array, Asset& asset);
 		Error parseMaterialExtensions(simdjson::dom::object& object, Material& material);
@@ -997,6 +1005,7 @@ namespace fastgltf {
 		void writeBuffers(const Asset& asset, std::string& json);
 		void writeBufferViews(const Asset& asset, std::string& json);
 		void writeCameras(const Asset& asset, std::string& json);
+		void writeGenerative(const Asset& asset, std::string& json);
 		void writeImages(const Asset& asset, std::string& json);
 		void writeLights(const Asset& asset, std::string& json);
 		void writeMaterials(const Asset& asset, std::string& json);

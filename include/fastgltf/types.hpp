@@ -273,6 +273,57 @@ namespace fastgltf {
 		Point,
 	};
 
+	/**
+	 * The kind of scene data a MYLAB_generative generator synthesises.
+	 */
+	FASTGLTF_EXPORT enum class GenerativeTask : std::uint8_t {
+		TextToMotion,
+		TextToCameraTrajectory,
+	};
+
+	/**
+	 * How a generator encodes the rotations it outputs. Generators declare this so that the
+	 * consumer never has to hardcode a convention per model.
+	 */
+	FASTGLTF_EXPORT enum class RotationEncoding : std::uint8_t {
+		Quaternion,
+		AxisAngle,
+		Rotation6D,
+	};
+
+	/** The up axis of a generator's output space. glTF itself is always Y-up. */
+	FASTGLTF_EXPORT enum class UpAxis : std::uint8_t {
+		Y,
+		Z,
+	};
+
+	/** The length unit of a generator's output space. glTF itself is always metres. */
+	FASTGLTF_EXPORT enum class LengthUnit : std::uint8_t {
+		Meters,
+		Centimeters,
+	};
+
+	/**
+	 * The camera basis a generator emits poses in. glTF cameras look down local -Z with +Y up;
+	 * OpenCV cameras look down local +Z with +Y down.
+	 */
+	FASTGLTF_EXPORT enum class CameraConvention : std::uint8_t {
+		Gltf,
+		OpenCV,
+	};
+
+	/** Whether a generator emits camera-to-world or world-to-camera transforms. */
+	FASTGLTF_EXPORT enum class PoseType : std::uint8_t {
+		CamToWorld,
+		WorldToCam,
+	};
+
+	/** Constraint on the first frame a generator produces. */
+	FASTGLTF_EXPORT enum class InitialPose : std::uint8_t {
+		Unconstrained,
+		BindPose,
+	};
+
 	FASTGLTF_EXPORT enum class Category : std::uint32_t {
 		None        = 0,
 		Buffers     = 1 <<  0,
@@ -2260,6 +2311,107 @@ namespace fastgltf {
 	};
 #endif
 
+	/**
+	 * Identifies the model backing a MYLAB_generative generator. The URI is relative to the glTF
+	 * file unless absolute; the hash makes generator output reproducible and cacheable.
+	 */
+	FASTGLTF_EXPORT struct GeneratorModel {
+		FASTGLTF_STD_PMR_NS::string uri;
+		/** Lowercase hex SHA-256 of the model file. */
+		FASTGLTF_STD_PMR_NS::string sha256;
+		/** Skeleton identifier the model was trained against, e.g. "smpl_22". Motion tasks only. */
+		FASTGLTF_STD_PMR_NS::string skeleton;
+	};
+
+	/**
+	 * The conventions a generator's output is expressed in. Every field other than fps has a
+	 * default matching glTF's own conventions, so a generator that already emits glTF-space data
+	 * only needs to declare its sampling rate.
+	 */
+	FASTGLTF_EXPORT struct GeneratorOutput {
+		/** Sampling rate of the generated tracks, in frames per second. Required, must be > 0. */
+		num fps;
+		RotationEncoding rotation = RotationEncoding::Quaternion;
+		UpAxis upAxis = UpAxis::Y;
+		LengthUnit units = LengthUnit::Meters;
+		/** Motion tasks leave this at its default. */
+		CameraConvention cameraConvention = CameraConvention::Gltf;
+		/** Motion tasks leave this at its default. */
+		PoseType poseType = PoseType::CamToWorld;
+	};
+
+	/**
+	 * One entry of the root-level MYLAB_generative generator registry. Nodes reference these by
+	 * index. Only ever non-empty when MYLAB_generative is enabled and used by the asset.
+	 */
+	FASTGLTF_EXPORT struct Generator {
+		GenerativeTask task;
+		GeneratorModel model;
+		GeneratorOutput output;
+
+		FASTGLTF_STD_PMR_NS::string name;
+	};
+
+	/**
+	 * Maps one joint of the model's own skeleton onto a glTF joint node. Mirrors Attribute in
+	 * shape: a name paired with an index into another array.
+	 */
+	FASTGLTF_EXPORT struct JointMapping {
+		/** Joint name as the model knows it, e.g. "left_hip". */
+		FASTGLTF_STD_PMR_NS::string name;
+		/** Index into Asset::nodes, which must also be a member of the node's skin joints. */
+		std::size_t nodeIndex;
+	};
+
+	/**
+	 * References to other nodes whose generated output this node's generator consumes. These
+	 * references form a DAG, which validate() rejects if cyclic.
+	 */
+	FASTGLTF_EXPORT struct GenerativeConditioning {
+		/** Node the generated camera should aim at. */
+		Optional<std::size_t> lookAtNode;
+		/** Node whose generated motion is fed to this generator as input. */
+		Optional<std::size_t> useGeneratedMotionOf;
+	};
+
+	/**
+	 * The node-level half of MYLAB_generative: which generator drives this node, and with what
+	 * conditioning. Only ever non-null when MYLAB_generative is enabled and used by the asset.
+	 */
+	FASTGLTF_EXPORT struct GenerativeNode {
+		/** Index into Asset::generators. */
+		std::size_t generator;
+
+		FASTGLTF_STD_PMR_NS::string prompt;
+		/**
+		 * Absent means the consumer picks a seed; output is then not reproducible.
+		 * Deliberately std::optional and not fastgltf::Optional: on 64-bit platforms
+		 * std::uint64_t is std::size_t, whose OptionalFlagValue sentinel is UINT64_MAX --
+		 * a perfectly legal seed that would silently read back as absent.
+		 */
+		std::optional<std::uint64_t> seed;
+
+		/** Start of this node's generated segment on the asset timeline, in seconds. */
+		num start = 0;
+		/** Length of the segment in seconds. Absent means it runs to the end of the timeline. */
+		Optional<num> duration;
+
+		/** Model joint name -> glTF joint node. Empty for tasks that do not drive a skin. */
+		FASTGLTF_FG_PMR_NS::MaybeSmallVector<JointMapping> jointMap;
+
+		InitialPose initialPose = InitialPose::Unconstrained;
+		GenerativeConditioning conditionOn;
+
+		/** Baked animation standard viewers play when nothing regenerates this node. */
+		Optional<std::size_t> fallbackAnimation;
+	};
+
+	/** Root-level timeline the generated segments are placed on. */
+	FASTGLTF_EXPORT struct GenerativeTimeline {
+		/** Total length in seconds. Must be > 0. */
+		num duration;
+	};
+
 	FASTGLTF_EXPORT struct Node {
 		Optional<std::size_t> meshIndex;
 		Optional<std::size_t> skinIndex;
@@ -2290,6 +2442,11 @@ namespace fastgltf {
 #if FASTGLTF_ENABLE_KHR_PHYSICS_RIGID_BODIES
 		std::unique_ptr<PhysicsRigidBody> physicsRigidBody;
 #endif
+
+		/**
+		 * Only ever non-null when MYLAB_generative is enabled and used by the asset.
+		 */
+		std::unique_ptr<GenerativeNode> generative;
 
 		bool visible = true;
 		bool selectable = true;
@@ -2843,6 +3000,12 @@ namespace fastgltf {
 
 		std::vector<std::string> materialVariants;
 
+		/**
+		 * Only ever non-empty when MYLAB_generative is enabled and used by the asset.
+		 */
+		std::vector<Generator> generators;
+		Optional<GenerativeTimeline> generativeTimeline;
+
 #if FASTGLTF_ENABLE_KHR_IMPLICIT_SHAPES
 		std::vector<Shape> shapes;
 #endif
@@ -2881,6 +3044,8 @@ namespace fastgltf {
 				skins(std::move(other.skins)),
 				textures(std::move(other.textures)),
 				materialVariants(std::move(other.materialVariants)),
+				generators(std::move(other.generators)),
+				generativeTimeline(std::move(other.generativeTimeline)),
 #if FASTGLTF_ENABLE_KHR_IMPLICIT_SHAPES
 				shapes(std::move(other.shapes)),
 #endif
@@ -2912,6 +3077,8 @@ namespace fastgltf {
 			skins = std::move(other.skins);
 			textures = std::move(other.textures);
 			materialVariants = std::move(other.materialVariants);
+			generators = std::move(other.generators);
+			generativeTimeline = std::move(other.generativeTimeline);
 #if FASTGLTF_ENABLE_KHR_IMPLICIT_SHAPES
 			shapes = std::move(other.shapes);
 #endif
